@@ -7,12 +7,13 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 
 	ex "github.com/Lafeng/deblocus/exception"
 	log "github.com/Lafeng/deblocus/glog"
 	. "github.com/Lafeng/deblocus/tunnel"
-	"github.com/codegangsta/cli"
+	"github.com/urfave/cli/v2"
 )
 
 var (
@@ -32,13 +33,14 @@ type bootContext struct {
 	showVer    bool
 	vSpecified bool
 	vFlag      int
-	cman       *ConfigMan
+	signals    int32
+	config     *ConfigContext
 	components []Component
 	closeable  []io.Closer
 }
 
 // global before handler
-func (ctx *bootContext) initialize(c *cli.Context) (err error) {
+func (ctx *bootContext) beforeHandler(c *cli.Context) (err error) {
 	// inject parameters into package.tunnel
 	VER_STRING = versionString()
 	VERSION = version
@@ -52,24 +54,23 @@ func (ctx *bootContext) initialize(c *cli.Context) (err error) {
 	return nil
 }
 
-func (ctx *bootContext) initConfig(r ServerRole) (role ServerRole) {
+func (ctx *bootContext) initialize(role ServiceRole) (current ServiceRole) {
 	var err error
 	// load config file
-	ctx.cman, err = DetectConfig(ctx.configFile)
+	ctx.config, err = NewConfigContextFromFile(ctx.configFile)
 	fatalError(err)
+
 	// parse config file
-	role, err = ctx.cman.InitConfigByRole(r)
-	if role == 0 {
-		err = fmt.Errorf("No server role defined in config")
-	}
+	current, err = ctx.config.Initialize(role)
 	fatalError(err)
+
 	if !ctx.vSpecified { // no -v
 		// set logV with config.v
-		if v := ctx.cman.LogV(role); v > 0 {
+		if v := ctx.config.LogV(current); v > 0 {
 			log.SetLogVerbose(v)
 		}
 	}
-	return role
+	return
 }
 
 // ./deblocus csc [-type algo]
@@ -84,12 +85,12 @@ func (ctx *bootContext) cscCommandHandler(c *cli.Context) error {
 // ./deblocus ccc [-addr SERV_ADDR:PORT] USER
 func (ctx *bootContext) cccCommandHandler(c *cli.Context) error {
 	// need server config
-	ctx.initConfig(SR_SERVER)
-	if args := c.Args(); len(args) == 1 {
+	ctx.initialize(SR_SERVER)
+	if args := c.Args(); args.Len() == 1 {
 		user := args.Get(0)
 		pubAddr := c.String("addr")
 		output := getOutputArg(c)
-		err := ctx.cman.CreateClientConfig(output, user, pubAddr)
+		err := ctx.config.CreateClientConfig(output, user, pubAddr)
 		fatalError(err)
 	} else {
 		fatalAndCommandHelp(c)
@@ -99,13 +100,13 @@ func (ctx *bootContext) cccCommandHandler(c *cli.Context) error {
 
 func (ctx *bootContext) keyInfoCommandHandler(c *cli.Context) error {
 	// need config
-	role := ctx.initConfig(SR_AUTO)
-	fmt.Fprintln(os.Stderr, ctx.cman.KeyInfo(role))
+	role := ctx.initialize(SR_AUTO)
+	fmt.Fprintln(os.Stderr, ctx.config.KeyInfo(role))
 	return nil
 }
 
 func (ctx *bootContext) startCommandHandler(c *cli.Context) error {
-	if len(c.Args()) > 0 {
+	if c.Args().Len() > 0 {
 		fatalAndCommandHelp(c)
 	}
 	// option as pseudo-command: help, version
@@ -114,29 +115,35 @@ func (ctx *bootContext) startCommandHandler(c *cli.Context) error {
 		return nil
 	}
 
-	role := ctx.initConfig(SR_AUTO)
-	if role&SR_SERVER != 0 {
-		go ctx.startServer()
-	}
-	if role&SR_CLIENT != 0 {
+	var role = ctx.initialize(SR_AUTO)
+	switch role {
+	case SR_CLIENT:
 		go ctx.startClient()
+
+	case SR_SERVER:
+		log.Infoln(versionString())
+		var server = NewServer(ctx.config)
+		for _, trans := range server.Transports() {
+			go ctx.startServer(server, trans)
+		}
 	}
+
 	waitSignal()
 	return nil
 }
 
 func (ctx *bootContext) startClient() {
-	defer func() {
-		sigChan <- Bye
-	}()
+	defer ctx.onRoleFinished(SR_CLIENT)
+
 	var (
 		conn *net.TCPConn
 		ln   *net.TCPListener
 		err  error
 	)
 
-	client := NewClient(ctx.cman)
-	addr := ctx.cman.ListenAddr(SR_CLIENT)
+	config := ctx.config
+	client := NewClient(config)
+	addr := config.ClientConf().ListenAddr
 
 	ln, err = net.ListenTCP("tcp", addr)
 	fatalError(err)
@@ -159,40 +166,65 @@ func (ctx *bootContext) startClient() {
 	}
 }
 
-func (ctx *bootContext) startServer() {
-	defer func() {
-		sigChan <- Bye
-	}()
+// start Server base on transport
+func (ctx *bootContext) startServer(server *Server, transport *Transport) {
+	defer ctx.onRoleFinished(SR_SERVER)
+
 	var (
-		conn *net.TCPConn
-		ln   *net.TCPListener
+		conn net.Conn
+		ln   net.Listener
 		err  error
 	)
 
-	server := NewServer(ctx.cman)
-	addr := ctx.cman.ListenAddr(SR_SERVER)
-
-	ln, err = net.ListenTCP("tcp", addr)
+	ln, err = transport.CreateServerListener(server)
 	fatalError(err)
 	defer ln.Close()
 
+	log.Infoln("Server is listening on", transport.TransType(), ln.Addr())
 	ctx.register(server, ln)
-	log.Infoln(versionString())
-	log.Infoln("Server is listening on", addr)
 
 	for {
-		conn, err = ln.AcceptTCP()
+		conn, err = ln.Accept()
 		if err == nil {
-			go server.TunnelServe(conn)
+			transport.SetupConnection(conn)
+			go server.HandleNewConnection(conn)
 		} else {
 			SafeClose(conn)
 		}
 	}
 }
 
+func (ctx *bootContext) onRoleFinished(role ServiceRole) {
+	switch role {
+	case SR_CLIENT:
+		sigChan <- Bye
+
+	case SR_SERVER:
+		if atomic.AddInt32(&ctx.signals, 1) == 2 {
+			sigChan <- Bye
+		}
+	}
+}
+
 func (ctx *bootContext) register(cmp Component, cz io.Closer) {
-	ctx.components = append(ctx.components, cmp)
-	ctx.closeable = append(ctx.closeable, cz)
+	var exists1, exists2 int
+	for _, v := range ctx.components {
+		if v == cmp {
+			exists1++
+		}
+	}
+	for _, v := range ctx.closeable {
+		if v == cz {
+			exists2++
+		}
+	}
+
+	if exists1 == 0 {
+		ctx.components = append(ctx.components, cmp)
+	}
+	if exists2 == 0 {
+		ctx.closeable = append(ctx.closeable, cz)
+	}
 }
 
 func (ctx *bootContext) doStats() {
@@ -212,6 +244,7 @@ func (ctx *bootContext) doClose() {
 	}
 }
 
+/*
 func (ctx *bootContext) setLogVerbose(verbose int) {
 	// prefer command line v option
 	if ctx.vFlag >= 0 {
@@ -220,6 +253,7 @@ func (ctx *bootContext) setLogVerbose(verbose int) {
 		log.SetLogVerbose(verbose)
 	}
 }
+*/
 
 func getOutputArg(c *cli.Context) string {
 	output := c.String("output")
@@ -264,11 +298,7 @@ func fatalError(err error, args ...interface{}) {
 
 func fatalAndCommandHelp(c *cli.Context) {
 	// app root
-	if c.Parent() == nil {
-		cli.HelpPrinter(os.Stderr, cli.AppHelpTemplate, c.App)
-	} else { // command
-		cli.HelpPrinter(os.Stderr, cli.CommandHelpTemplate, c.Command)
-	}
+	fmt.Println("Unknown input --->", strings.Join(c.Args().Slice(), " "))
 	context.doClose()
-	os.Exit(1)
+	cli.ShowAppHelpAndExit(c, 2)
 }

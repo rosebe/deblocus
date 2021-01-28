@@ -88,7 +88,7 @@ func (t *Session) tokensHandle(args []byte) {
 	}
 }
 
-func (t *Session) DataTunServe(tun *Conn, isNewSession bool) {
+func (t *Session) ListenTunnel(tun *Conn, isNewSession bool) {
 	defer func() {
 		if atomic.AddInt32(&t.activeCnt, -1) <= 0 {
 			t.destroy()
@@ -225,8 +225,8 @@ type Server struct {
 	filter     Filterable
 }
 
-func NewServer(cman *ConfigMan) *Server {
-	conf := cman.sConf
+func NewServer(config *ConfigContext) *Server {
+	conf := config.server
 	s := &Server{
 		serverConf: conf,
 		sharedKey:  preSharedKey(conf.publicKey),
@@ -261,22 +261,20 @@ func NewServer(cman *ConfigMan) *Server {
 	return s
 }
 
-func (t *Server) TunnelServe(raw *net.TCPConn) {
+func (t *Server) HandleNewConnection(raw net.Conn) {
 	var conn = NewConn(raw, nullCipherKit)
 	defer func() {
 		ex.Catch(recover(), nil)
 	}()
 
-	man := &d5sman{
-		Server:     t,
-		clientAddr: raw.RemoteAddr(),
-	}
+	var protocol = newD5ServerProtocol(t, raw.RemoteAddr())
 	// read atomically
 	tcPool := *(*[]uint64)(atomic.LoadPointer(&t.tcPool))
-	session, err := man.Connect(conn, tcPool)
+	// handshake or resume a session
+	session, err := protocol.Connect(conn, tcPool)
 
 	if err == nil {
-		go session.DataTunServe(conn, man.isNewSession)
+		session.ListenTunnel(conn, protocol.isNewSession)
 	} else {
 		SafeClose(raw)
 		if session != nil {
@@ -304,6 +302,12 @@ func (s *Server) updateNow() {
 
 // implement Stats()
 func (t *Server) Stats() string {
+	buf := new(bytes.Buffer)
+	// reload AuthSys
+	t.AuthSys.Reload()
+	buf.WriteString(t.AuthSys.Stats())
+
+	// collect active sessions
 	uniqClient := make(map[string]byte)
 	t.sessionMgr.lock.RLock()
 	for _, s := range t.sessionMgr.container {
@@ -312,7 +316,8 @@ func (t *Server) Stats() string {
 		}
 	}
 	t.sessionMgr.lock.RUnlock()
-	buf := new(bytes.Buffer)
+
+	// print all
 	for k, n := range uniqClient {
 		buf.WriteString(fmt.Sprintf("Clt=%s Conn=%d\n", k, n))
 	}
@@ -328,4 +333,8 @@ func (t *Server) Close() {
 			s.destroy()
 		}
 	}
+}
+
+func (t *Server) Transports() []*Transport {
+	return t.transports
 }

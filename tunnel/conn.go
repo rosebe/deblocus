@@ -26,15 +26,15 @@ func NewConn(conn net.Conn, cipher cipherKit) *Conn {
 }
 
 func (c *Conn) SetId(name string, isServ bool) {
-	ra := c.RemoteAddr().(*net.TCPAddr)
-	la := c.LocalAddr().(*net.TCPAddr)
+	ra := c.RemoteAddr()
 	if isServ {
 		// unique in server instance
 		// fmt: user@full_addr
 		c.identifier = fmt.Sprintf("%s@%s", name, ra.String())
 	} else {
+		la := c.LocalAddr()
 		// for client
-		c.identifier = fmt.Sprintf("%d:%d", la.Port, ra.Port)
+		c.identifier = fmt.Sprintf("%d:%d", port(la), port(ra))
 	}
 }
 

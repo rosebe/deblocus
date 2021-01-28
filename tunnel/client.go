@@ -33,19 +33,21 @@ type Client struct {
 	mux       *multiplexer
 	token     []byte
 	params    *tunParams
-	connInfo  *connectionInfo
+	transport *Transport
 	lock      sync.Locker
 	dtCnt     int32
 	reqCnt    int32
 	state     int32
 	round     int32
 	pendingTK *timedWait
+	pacFile   string
 }
 
-func NewClient(cman *ConfigMan) *Client {
+func NewClient(config *ConfigContext) *Client {
 	clt := &Client{
+		transport: config.client.transport,
+		pacFile:   config.client.pacFile,
 		lock:      new(sync.Mutex),
-		connInfo:  cman.cConf.connInfo,
 		state:     CLT_WORKING,
 		pendingTK: NewTimedWait(false), // waiting tokens
 	}
@@ -54,16 +56,16 @@ func NewClient(cman *ConfigMan) *Client {
 
 func (c *Client) initialConnect() (tun *Conn) {
 	var theParam = new(tunParams)
-	var man = &d5cman{connectionInfo: c.connInfo}
+	var protocol = newD5ClientProtocol(c)
 	var err error
-	tun, err = man.Connect(theParam)
+	tun, err = protocol.Connect(theParam)
 	if err != nil {
 		log.Errorf("Failed to connect to %s %s Retry after %s",
-			c.connInfo.RemoteName(), ex.Detail(err), RETRY_INTERVAL)
+			c.transport.RemoteName(), ex.Detail(err), RETRY_INTERVAL)
 		return nil
 	} else {
-		log.Infof("Login to server %s with %s successfully",
-			c.connInfo.RemoteName(), c.connInfo.user)
+		log.Infof("Login to server %s@%s/%s successfully",
+			c.transport.user, c.transport.RemoteName(), c.transport.transType)
 		c.params = theParam
 		c.token = theParam.token
 		return
@@ -156,7 +158,7 @@ func (c *Client) StartTun(mustRestart bool) {
 			if dtcnt <= 0 {
 				if atomic.CompareAndSwapInt32(&c.state, CLT_WORKING, CLT_PENDING) {
 					log.Errorf("Currently offline, all connections %s were lost",
-						c.connInfo.RemoteName())
+						c.transport.RemoteName())
 					go c.StartTun(true)
 				}
 				return
@@ -169,16 +171,14 @@ func (c *Client) StartTun(mustRestart bool) {
 }
 
 func (c *Client) ClientServe(conn net.Conn) {
-	var done bool
 	defer func() {
 		ex.Catch(recover(), nil)
-		if !done {
-			SafeClose(conn)
-		}
+		SafeClose(conn)
 	}()
 
 	reqNum := atomic.AddInt32(&c.reqCnt, 1)
 	pbConn := NewPushbackInputStream(conn)
+
 	proto, err := detectProtocol(pbConn)
 	if err != nil {
 		// chrome will make some advance connections and then aborted
@@ -189,41 +189,83 @@ func (c *Client) ClientServe(conn net.Conn) {
 		return
 	}
 
+	var dest string
+	var done int
+
 	switch proto {
 	case PROT_SOCKS5:
-		s5 := socks5Handler{pbConn}
+		var s5 = socks5Handler{pbConn}
+		var ok bool
 		if s5.handshake() {
-			if literalTarget, ok := s5.readRequest(); ok {
-				c.mux.HandleRequest("SOCKS5", conn, literalTarget)
-				done = true
+			if dest, ok = s5.readRequest(); ok {
+				done = c.mux.HandleRequest("SOCKS5", pbConn, dest)
 			}
 		}
+
 	case PROT_HTTP:
-		proto, target, err := httpProxyHandshake(pbConn)
+		proto, dest, err = httpProxyHandshake(pbConn)
 		if err != nil {
 			log.Warningln(err)
 			break
 		}
+
 		switch proto {
 		case PROT_HTTP:
 			// plain http
-			c.mux.HandleRequest("HTTP", pbConn, target)
+			done = c.mux.HandleRequest("HTTP", pbConn, dest)
 		case PROT_HTTP_T:
 			// http tunnel
-			c.mux.HandleRequest("HTTP/T", conn, target)
+			done = c.mux.HandleRequest("HTTP/T", conn, dest)
 		case PROT_LOCAL:
-			// target is requestUri
-			c.localServlet(conn, target)
+			// dest is requestUri
+			c.localServlet(conn, dest)
+			done = 1
 		}
-		done = true
+
 	default:
 		log.Warningln("Unrecognized request from", conn.RemoteAddr())
 		time.Sleep(REST_INTERVAL)
 	}
+
+	// -1: remote denied
+	//  0: cannt accept
+	//  1: processed
+	if done == -1 && dest != "" {
+		c.localRelay(pbConn, dest)
+	}
+
 	// client setSeed at every 32 req
 	if reqNum&0x1f == 0x1f {
 		myRand.setSeed(0)
 	}
+}
+
+// pipe localConn to dest via local connections
+func (p *Client) localRelay(localConn net.Conn, target string) {
+	var targetConn, err = net.Dial("tcp", target)
+	if err != nil {
+		log.Errorf("Dial %s failed in local", target)
+		return
+	}
+	defer targetConn.Close()
+
+	log.Warningf("Connection to %s via local network", target)
+
+	var writeDone = make(chan int, 1)
+	localConn.SetDeadline(time.Now().Add(time.Hour))
+
+	go func() {
+		// write: local -> remote
+		w, _ := io.Copy(targetConn, localConn)
+		writeDone <- int(w)
+		closeW(targetConn)
+	}()
+
+	// read: remote -> local
+	io.Copy(localConn, targetConn)
+
+	// readDone && writeDone
+	<-writeDone
 }
 
 func (t *Client) IsReady() bool {
@@ -236,8 +278,7 @@ func (t *Client) createDataTun() (c *Conn, err error) {
 	if err != nil {
 		return
 	}
-	man := &d5cman{connectionInfo: t.connInfo}
-	return man.ResumeSession(t.params, token)
+	return newD5ClientProtocol(t).ResumeSession(t.params, token)
 }
 
 func (c *Client) eventHandler(e event, msg ...interface{}) {
@@ -249,7 +290,7 @@ func (c *Client) eventHandler(e event, msg ...interface{}) {
 
 func (t *Client) Stats() string {
 	return fmt.Sprintf("Client -> %s Conn=%d TK=%d",
-		t.connInfo.sAddr, atomic.LoadInt32(&t.dtCnt), len(t.token)/TKSZ)
+		t.transport.remoteHost, atomic.LoadInt32(&t.dtCnt), len(t.token)/TKSZ)
 }
 
 func (t *Client) Close() {
